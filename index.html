@@ -1,0 +1,1547 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>最小机器人闭环 Demo · 迷宫版可视化</title>
+<!--
+  ============================================================================
+  最小机器人闭环 Demo · 迷宫版（单文件网页应用，无外部依赖）
+  ----------------------------------------------------------------------------
+  本页面把 demo/sim/（Python 版）的控制逻辑 1:1 移植到浏览器端：
+
+    sim/environment.py  → Env 类     （①感知：高斯噪声测量；③执行：单车模型
+                                        欧拉积分 + 限幅 + 墙壁碰撞；④反馈：
+                                        奖励 / 累计回报 / 终止判定）
+    sim/controller.py   → PID / Decision 类（②决策：航向环 + 距离环双 PID，
+                                        cos(e_head) 协调 + 执行器限幅）
+    sim/closed_loop.py  → closedLoopStep()（把四个环节串成一圈闭环）
+    sim/loop_logger.py  → app.log（逐步记录 State / Action / Reward / Return，
+                                        可导出与 Python 版同口径的 CSV）
+
+  迷宫化改动（与 Python 版的唯一差异，已在页面底部注明）：
+    * 单一目标点  → 路点序列（到达当前路点 ≤ 0.30m 后目标自动切换）；
+    * 活动范围夹紧 → 迷宫墙壁碰撞（推出 + 惩罚 -1，对应原越界惩罚）；
+    * 奖励公式保持一致，另加路点进度奖励 +2（终点 +10 不变）。
+
+  使用：直接用浏览器打开本文件即可，无需服务器与任何依赖。
+  注意：请勿用“文本编辑.app”等富文本编辑器打开并保存本文件（会破坏代码）。
+  ============================================================================
+-->
+<style>
+/* ============================ 全局样式（暗色仪表盘风格） ============================ */
+:root{
+  --bg:#0b0f17; --panel:#121a26; --panel2:#0e1622; --border:#22304a;
+  --text:#d9e3f0; --muted:#8ba0ba; --dim:#5c7089;
+  --blue:#4f8ef7; --orange:#f0a03c; --green:#3ac979; --red:#ef5b5b;
+  --magenta:#d06bf2; --cyan:#35d0c5;
+  --mono:'SF Mono',ui-monospace,Menlo,Consolas,'Courier New',monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--text);
+  font:14px/1.5 -apple-system,'PingFang SC','Microsoft YaHei','Noto Sans CJK SC',sans-serif;}
+
+/* ---------- 页头 ---------- */
+header{max-width:1560px;margin:0 auto;padding:16px 18px 4px;
+  display:flex;justify-content:space-between;align-items:flex-end;gap:16px;flex-wrap:wrap}
+h1{margin:0;font-size:20px;letter-spacing:.5px}
+h1 .sub{color:var(--muted);font-weight:400;font-size:14.5px;margin-left:6px}
+.note{margin:5px 0 0;color:var(--muted);font-size:12px;max-width:680px}
+.controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+select{background:#1b2940;border:1px solid #2e4260;color:#dfe9f5;
+  border-radius:8px;padding:7px 8px;font-size:13px;outline:none}
+
+/* ---------- 状态徽标 ---------- */
+.badge{display:inline-flex;align-items:center;gap:6px;padding:4px 12px;
+  border-radius:999px;font-size:12.5px;font-weight:600;border:1px solid;white-space:nowrap}
+.badge.idle{color:#9fb2c9;border-color:#33445f;background:#141d2b}
+.badge.running{color:#7db1ff;border-color:#2f5db1;background:#12203a;animation:pulse 1.6s infinite}
+.badge.paused{color:#f0a03c;border-color:#7a5426;background:#241a0e}
+.badge.success{color:#3ac979;border-color:#2b6e48;background:#0e2018}
+.badge.timeout{color:#ef5b5b;border-color:#7e3030;background:#241010}
+@keyframes pulse{50%{opacity:.6}}
+
+/* ---------- 按钮 ---------- */
+.btn{background:#1b2940;border:1px solid #2e4260;color:#dfe9f5;border-radius:8px;
+  padding:7px 14px;font-size:13px;cursor:pointer;transition:background .15s,border-color .15s}
+.btn:hover{background:#243453;border-color:#3d5878}
+.btn.primary{background:#3a76d9;border-color:#3a76d9;color:#fff;font-weight:600}
+.btn.primary:hover{background:#4f8ef7}
+.btn.small{padding:4px 10px;font-size:12px}
+
+/* ---------- 主布局（v4）：左列（场景+PID）｜右列（流程+双曲线并排+读数+Reward）｜底行（全宽日志） ----------
+   两列底部对齐：grid 行内两列默认等高（stretch），左列 PID / 右列读数各自 flex:1
+   吸收多余高度，使 Reward/Return 面板底部与 PID 面板底部对齐；
+   逐步日志占据全宽底行，位于 Reward/Return 与 PID 两个面板下方 */
+main{max-width:1560px;margin:0 auto;padding:12px 18px 6px;display:grid;gap:14px;
+  grid-template-columns:minmax(400px,0.9fr) minmax(460px,1.1fr);
+  grid-template-areas:"left right" "bottom bottom"}
+.left-col{grid-area:left;display:flex;flex-direction:column;gap:14px;min-width:0}
+.right-col{grid-area:right;display:flex;flex-direction:column;gap:14px;min-width:0}
+.log-panel{grid-area:bottom}
+@media(max-width:1180px){
+  main{grid-template-columns:1fr;grid-template-areas:"left" "right" "bottom"}
+}
+
+/* ---------- 误差/动作双曲线并排 ---------- */
+.charts-duo{display:flex;gap:14px;flex-wrap:wrap}
+.charts-duo .chart-panel{flex:1 1 280px;min-width:260px}
+
+/* ---------- 列内弹性填充（底部对齐的关键） ---------- */
+.pid-panel{flex:1;display:flex;flex-direction:column}
+.pid-panel #sliders{flex:1;display:flex;flex-direction:column;
+  justify-content:space-evenly}
+.readouts-panel{flex:1;display:flex;flex-direction:column;min-height:0}
+.readouts-panel .tiles{flex:1;align-content:space-evenly}
+
+/* ---------- 面板 ---------- */
+.panel{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:12px 14px;min-width:0}
+.panel-head{display:flex;align-items:center;justify-content:space-between;gap:10px;
+  margin-bottom:10px;flex-wrap:wrap}
+.panel-head h2{margin:0;font-size:14.5px;font-weight:600}
+.panel-head .hint{font-size:11px;color:var(--dim)}
+
+/* ---------- 场景画布 ---------- */
+#scene{display:block;width:100%;border-radius:10px;background:#0a0e16;
+  border:1px solid #1c2840}
+.toggles{display:flex;gap:14px;font-size:12px;color:var(--muted);flex-wrap:wrap}
+.toggles label{display:flex;align-items:center;gap:4px;cursor:pointer;user-select:none}
+.toggles input{accent-color:#4f8ef7;cursor:pointer}
+
+/* ---------- 闭环流程（四阶段卡片） ---------- */
+.stages{display:flex;align-items:stretch;gap:5px}
+.stage{flex:1;background:var(--panel2);border:1px solid #24344e;
+  border-top:3px solid var(--sc,#4f8ef7);border-radius:10px;padding:8px 10px;
+  min-width:0;transition:background .25s,box-shadow .25s}
+.stage .nm{font-weight:600;font-size:13px;color:var(--sc,#4f8ef7);white-space:nowrap}
+.stage .nm span{color:var(--dim);font-weight:400;font-size:10.5px;margin-left:3px}
+.stage .vl{font-family:var(--mono);font-size:11px;margin:6px 0 4px;color:var(--text);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.stage .ds{font-size:10.5px;color:var(--muted);line-height:1.4}
+.stage.active{background:#16233a;box-shadow:0 0 0 1px var(--sc),0 0 16px -3px var(--sc)}
+.arrow{align-self:center;color:#3d5372;font-size:14px;animation:flow 1.6s infinite}
+@keyframes flow{0%,100%{opacity:.4;transform:translateX(0)}50%{opacity:1;transform:translateX(3px)}}
+.feedback-return{margin-top:9px;text-align:center;font-size:11.5px;color:var(--dim);
+  border-top:1px dashed #2a3a55;padding-top:7px}
+#loopStepInfo{font-family:var(--mono);font-size:11.5px;color:var(--muted)}
+
+/* ---------- 参数面板（滑块；弹性容器内均匀分布） ---------- */
+.cfg-note{font-family:var(--mono);font-size:11px;color:var(--dim);margin-bottom:4px}
+.srow{display:grid;grid-template-columns:126px 1fr 50px;align-items:center;gap:10px;margin:4px 0}
+.srow label{font-size:12.5px;color:var(--muted);white-space:nowrap}
+.srow input[type=range]{width:100%;accent-color:#4f8ef7;height:18px;cursor:pointer}
+.srow .sv{font-family:var(--mono);font-size:12px;text-align:right;color:var(--text)}
+
+/* ---------- 实时读数（紧凑瓦片） ---------- */
+.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(116px,1fr));gap:7px}
+.tile{background:var(--panel2);border:1px solid #22304a;border-radius:8px;padding:5px 8px;min-width:0}
+.tile .tl{font-size:10px;color:var(--dim);margin-bottom:1px;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.tile .tv{font-family:var(--mono);font-size:11.5px;font-weight:600;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+
+/* ---------- 曲线面板（误差/动作缩小后并排；Reward 在右列底部、读数之下） ---------- */
+.chart-body{position:relative}
+.chart-panel canvas{display:block;width:100%;height:118px;border-radius:8px;
+  background:#0a0e16;border:1px solid #1c2840}
+.rw-panel canvas{height:196px}
+.lg{display:flex;gap:12px;font-size:11px;color:var(--muted);align-items:center;flex-wrap:wrap}
+.lg span{display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
+.lg i{display:inline-block;width:14px;height:3px;border-radius:2px}
+.lg.compact{font-size:10px;gap:8px}
+.lg.compact span{gap:3px}
+.lg.compact i{width:11px;height:2.5px}
+
+/* ---------- 日志表 ---------- */
+.log-scroll{max-height:192px;overflow:auto;border:1px solid #1d2a40;border-radius:8px}
+table{width:100%;border-collapse:collapse;font-size:12px}
+thead th{position:sticky;top:0;background:#131d2c;color:var(--muted);font-weight:500;
+  padding:6px 10px;text-align:left;white-space:nowrap;z-index:1}
+tbody td{padding:4.5px 10px;border-top:1px solid #182337;white-space:nowrap}
+tbody tr:nth-child(odd){background:rgba(255,255,255,.015)}
+td.mono{font-family:var(--mono)}
+.pos{color:var(--green)} .neg{color:var(--red)}
+
+/* ---------- 页脚 ---------- */
+footer{max-width:1560px;margin:0 auto;padding:6px 18px 22px;color:var(--dim);font-size:12px}
+footer b{color:var(--muted)}
+.mono{font-family:var(--mono)}
+</style>
+</head>
+<body>
+
+<!-- ==================== 页头：标题 / 状态 / 全局控制 ==================== -->
+<header>
+  <div>
+    <h1>最小机器人闭环 Demo<span class="sub">· 迷宫版可视化</span></h1>
+  </div>
+  <div class="controls">
+    <span id="statusBadge" class="badge idle">● 待运行</span>
+    <select id="mazeSelect" title="选择迷宫">
+      <option value="snake">蛇形迷宫（4×3）</option>
+      <option value="random">随机迷宫（5×4）</option>
+      <option value="big">大迷宫（10×8）</option>
+    </select>
+    <select id="speedSelect" title="仿真回放速度（dt=0.05s，1× = 实时）">
+      <option value="0.5">0.5×</option>
+      <option value="1">1× 实时</option>
+      <option value="2" selected>2×</option>
+      <option value="4">4×</option>
+      <option value="8">8×</option>
+    </select>
+    <button id="btnStart" class="btn primary">▶ 开始</button>
+    <button id="btnStep" class="btn">单步</button>
+    <button id="btnReset" class="btn">↺ 重置</button>
+    <button id="btnNewMaze" class="btn" style="display:none" title="重新生成一个随机迷宫">🎲 换迷宫</button>
+  </div>
+</header>
+
+<main>
+  <!-- ==================== 左列：二维迷宫仿真环境（上）+ PID 与噪声参数（下） ==================== -->
+  <div class="left-col">
+
+  <!-- 二维迷宫仿真环境 -->
+  <section class="panel scene-panel">
+    <div class="panel-head">
+      <h2>二维迷宫仿真环境</h2>
+      <div class="toggles">
+        <label><input type="checkbox" id="toggleMeas" checked>带噪测量</label>
+        <label><input type="checkbox" id="toggleTarget" checked>决策目标线</label>
+        <label><input type="checkbox" id="toggleNoise" checked>噪声 3σ 圈</label>
+      </div>
+    </div>
+    <canvas id="scene"></canvas>
+  </section>
+
+  <!-- PID 与噪声参数滑块（置于迷宫场景正下方） -->
+  <section class="panel pid-panel">
+    <div class="panel-head">
+      <h2>PID 与噪声参数（实时生效）</h2>
+      <button id="btnDefault" class="btn small" title="恢复 Python 版默认参数">恢复默认</button>
+    </div>
+    <div class="cfg-note">dt=0.05s(20Hz) · v_max=1.2m/s · w_max=3.0rad/s · 路点容差 0.30m · 奖励口径同 sim/environment.py</div>
+    <div id="sliders"></div>
+  </section>
+
+  </div><!-- /left-col -->
+
+  <!-- ============ 右列：闭环流程 → 误差/动作曲线（并排）→ 实时读数 → Reward/Return ============ -->
+  <div class="right-col">
+
+    <!-- 闭环四阶段（感知→决策→执行→反馈） -->
+    <div class="panel">
+      <div class="panel-head">
+        <h2>闭环控制流程</h2>
+        <span id="loopStepInfo">Step 0 · t=0.00 s</span>
+      </div>
+      <div class="stages">
+        <div class="stage" id="st0" style="--sc:#35d0c5">
+          <div class="nm">① 感知<span>sense()</span></div>
+          <div class="vl" id="val0">—</div>
+          <div class="ds">高斯噪声位姿测量（真实状态不可见）</div>
+        </div>
+        <div class="arrow">▶</div>
+        <div class="stage" id="st1" style="--sc:#f0a03c">
+          <div class="nm">② 决策<span>decide()</span></div>
+          <div class="vl" id="val1">—</div>
+          <div class="ds">双 PID：航向环→w，距离环→v·cos(e)</div>
+        </div>
+        <div class="arrow">▶</div>
+        <div class="stage" id="st2" style="--sc:#4f8ef7">
+          <div class="nm">③ 执行<span>step()</span></div>
+          <div class="vl" id="val2">—</div>
+          <div class="ds">单车模型积分 + 限幅 + 墙壁碰撞</div>
+        </div>
+        <div class="arrow">▶</div>
+        <div class="stage" id="st3" style="--sc:#d06bf2">
+          <div class="nm">④ 反馈<span>reward</span></div>
+          <div class="vl" id="val3">—</div>
+          <div class="ds">奖励 + 累计回报 → 驱动下一圈闭环</div>
+        </div>
+      </div>
+      <div class="feedback-return">◂ 反馈回流：新的带噪测量与奖励进入下一圈闭环（高亮按时间轮换，表示闭环持续运转）</div>
+    </div>
+
+    <!-- 误差 + 动作曲线（缩小后并排放置） -->
+    <div class="charts-duo">
+
+    <!-- 误差曲线（缩小版） -->
+    <div class="panel chart-panel">
+      <div class="panel-head">
+        <h2>误差曲线</h2>
+        <div class="lg compact">
+          <span><i style="background:#4f8ef7"></i>距离 e</span>
+          <span><i style="background:#3ac979"></i>|航向|</span>
+        </div>
+      </div>
+      <div class="chart-body"><canvas id="chartErr"></canvas></div>
+    </div>
+
+    <!-- 动作曲线（缩小版） -->
+    <div class="panel chart-panel">
+      <div class="panel-head">
+        <h2>动作曲线</h2>
+        <div class="lg compact">
+          <span><i style="background:#4f8ef7"></i>v</span>
+          <span><i style="background:#3ac979"></i>w</span>
+        </div>
+      </div>
+      <div class="chart-body"><canvas id="chartAct"></canvas></div>
+    </div>
+
+    </div><!-- /charts-duo -->
+
+    <!-- 实时读数（与 Reward/Return 上下排列；面板弹性填充，把 Reward/Return 推到右列底部） -->
+    <div class="panel readouts-panel">
+      <div class="panel-head"><h2>实时读数</h2></div>
+      <div class="tiles" id="readouts"></div>
+    </div>
+
+    <!-- Reward / Return 曲线（置于实时读数下方，底部与左列 PID 面板底部对齐） -->
+    <div class="panel chart-panel rw-panel">
+      <div class="panel-head">
+        <h2>Reward / Return</h2>
+        <div class="lg">
+          <span><i style="background:#35d0c5"></i>逐步 Reward</span>
+          <span><i style="background:#d06bf2"></i>累计 Return</span>
+        </div>
+      </div>
+      <div class="chart-body"><canvas id="chartRw"></canvas></div>
+    </div>
+
+  </div><!-- /right-col -->
+
+  <!-- ============ 底行：逐步日志全宽，置于 Reward/Return 与 PID 面板下方 ============ -->
+  <section class="panel log-panel">
+    <div class="panel-head">
+      <h2>逐步日志 · State / Action / Reward / Return</h2>
+      <button id="btnCsv" class="btn small">⬇ 导出 CSV（完整字段）</button>
+    </div>
+    <div class="log-scroll" id="logScroll">
+      <table>
+        <thead><tr>
+          <th>步</th><th>t (s)</th>
+          <th>真值 State (x, y, θ°)</th><th>测量 State (x̂, ŷ, θ̂°)</th>
+          <th>Action (v, w)</th><th>Reward</th><th>Return</th><th>路点</th>
+        </tr></thead>
+        <tbody id="logBody"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <p><b>数据口径</b>：奖励 r = −dist − 0.3·|e_head| − 0.05·能耗 − 1·碰撞 + 2·路点 + 10·到达终点（与
+  sim/environment.py::_reward 一致，路点 +2 为迷宫化扩展）；Return 为累计回报 Σr。
+  迷宫版把 Python 版的单一目标点扩展为<b>路点序列</b>（到达当前路点后目标自动切换），控制律
+  （双 PID + cos(e_head) 协调 + 限幅）、传感器噪声与奖励公式均与 demo/sim 完全一致；
+  导出的 CSV 字段与 Python 版 closed_loop_log.csv 同口径（另加 waypoint / collision 列）。</p>
+</footer>
+
+<script>
+'use strict';
+/* =====================================================================
+ * 0. 基础工具：角度归一化 / 数值夹取 / 格式化 / 可复现随机数
+ *    （分别对应 Python 版的 wrap_angle / np.clip / 打印格式 / np.random.default_rng）
+ * ===================================================================== */
+
+/** 角度归一化到 (-π, π]：航向误差在 ±π 处不连续，必须先归一化（同 wrap_angle）。
+ *  注意：JS 的 % 对负被除数返回负值（与 Python 不同），故需补一次 +2π 修正。 */
+function wrapAngle(a){
+  a = (a + Math.PI) % (2 * Math.PI);
+  if (a < 0) a += 2 * Math.PI;
+  return a - Math.PI;
+}
+
+/** 数值夹取到 [lo, hi]（同 np.clip）。 */
+function clamp(v, lo, hi){ return v < lo ? lo : (v > hi ? hi : v); }
+
+/** 弧度 → 度。 */
+const deg = r => r * 180 / Math.PI;
+
+/** 带符号定宽格式化：fmt(1.2) → "+1.20"。 */
+function fmt(v, d = 2){ return (v >= 0 ? '+' : '') + v.toFixed(d); }
+
+/**
+ * RNG —— 可复现随机数发生器（mulberry32 + Box-Muller 正态）。
+ * 与 Python 端 default_rng(seed) 对应：固定种子 → 每次刷新页面噪声序列一致，
+ * 便于复现实验与对比调参效果。
+ */
+class RNG {
+  constructor(seed){
+    this.s = (seed >>> 0) || 1;   // mulberry32 内部状态（非 0）
+    this.spare = null;            // Box-Muller 缓存的第二个正态样本
+  }
+  /** [0,1) 均匀分布（mulberry32 算法）。 */
+  next(){
+    let t = this.s += 0x6D2B79F5;
+    t = Math.imul(t ^ t >>> 15, t | 1);
+    t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  }
+  /** N(mu, sigma²) 正态分布（Box-Muller 极坐标形式；sigma≤0 时直接返回 mu）。 */
+  normal(mu = 0, sigma = 1){
+    if (sigma <= 0) return mu;
+    if (this.spare !== null){ const v = this.spare; this.spare = null; return mu + sigma * v; }
+    let u;
+    do { u = this.next(); } while (u === 0);
+    const v = this.next(), m = Math.sqrt(-2 * Math.log(u));
+    this.spare = m * Math.sin(2 * Math.PI * v);
+    return mu + sigma * m * Math.cos(2 * Math.PI * v);
+  }
+}
+
+/* =====================================================================
+ * 1. PID 控制器（sim/controller.py::PIDController 的 1:1 移植）
+ *    u = Kp·e + Ki·∫e·dt + Kd·de/dt，含积分限幅 + 输出限幅（anti-windup）
+ * ===================================================================== */
+class PID {
+  /**
+   * @param kp/ki/kd      三个增益
+   * @param outMin/outMax 输出限幅（= 执行器物理极限）
+   * @param iLimit        积分限幅（简单 anti-windup：饱和时积分不再累积）
+   */
+  constructor(kp, ki, kd, outMin, outMax, iLimit){
+    this.kp = kp; this.ki = ki; this.kd = kd;
+    this.outMin = outMin; this.outMax = outMax; this.iLimit = iLimit;
+    this.reset();
+  }
+  /** 清零内部状态（积分项 / 上一拍误差），新一轮任务开始时调用。 */
+  reset(){ this.integral = 0; this.prevError = null; }
+  /** 在线修改增益（滑块实时调参，对应 Python 的 set_gains，不清零内部状态）。 */
+  setGains(kp, ki, kd){ this.kp = kp; this.ki = ki; this.kd = kd; }
+  /** 计算一步 PID 输出（离散差分实现；第一拍微分记 0）。 */
+  update(e, dt){
+    // 积分项：累加后限幅（anti-windup）
+    this.integral += e * dt;
+    this.integral = Math.sign(this.integral) * Math.min(Math.abs(this.integral), this.iLimit);
+    // 微分项：一阶差分 (e_k - e_{k-1}) / dt
+    const derivative = (this.prevError === null) ? 0 : (e - this.prevError) / dt;
+    this.prevError = e;
+    // 合成并限幅
+    const u = this.kp * e + this.ki * this.integral + this.kd * derivative;
+    return clamp(u, this.outMin, this.outMax);
+  }
+}
+
+/* =====================================================================
+ * 2. 迷宫（网格迷宫：蛇形预设 / DFS 回溯随机生成 / BFS 求解）
+ *    坐标系：世界坐标（米），x 向右、y 向上；格子尺寸 cs=2m，墙厚 wt=0.18m
+ * ===================================================================== */
+class Maze {
+  constructor(cols, rows, cs = 2.0, wt = 0.18){
+    this.cols = cols; this.rows = rows; this.cs = cs; this.wt = wt;
+    // vOpen[i][j]：竖直墙线 X=i*cs 在第 j 行是否打通（i=0 与 i=cols 为外边界，恒关）
+    // 索引语义：vOpen[墙线号 i ∈ 0..cols][行 j ∈ 0..rows-1] → 外层 cols+1、内层 rows
+    this.vOpen = Array.from({length: cols + 1}, () => new Array(rows).fill(false));
+    // hOpen[i][j]：水平墙线 Y=j*cs 在第 i 列是否打通（j=0 与 j=rows 为外边界，恒关）
+    // 索引语义：hOpen[列 i ∈ 0..cols-1][墙线号 j ∈ 0..rows] → 外层 cols、内层 rows+1
+    //（注意外层是“列”不是“墙线号”：转置写法在 cols>rows+1 时越界，
+    //  4×3 / 5×4 因恰好 cols=rows+1 而侥幸可用，10×8 大迷宫触发崩溃 —— 已修正）
+    this.hOpen = Array.from({length: cols}, () => new Array(rows + 1).fill(false));
+    this.path = [];      // 起点到终点的单元格序列（路点 = 各格中心）
+    this._rects = null;  // 墙体矩形缓存（碰撞检测与绘制共用）
+  }
+  /** 世界尺寸（米）。 */
+  get W(){ return this.cols * this.cs; }
+  get H(){ return this.rows * this.cs; }
+  /** 单元格中心的世界坐标。 */
+  cellCenter(c){ return [(c[0] + 0.5) * this.cs, (c[1] + 0.5) * this.cs]; }
+  /** 打通竖直墙线 i（仅内部线有效）。 */
+  openV(i, j){ if (i > 0 && i < this.cols) this.vOpen[i][j] = true; }
+  /** 打通水平墙线 j（仅内部线有效）。 */
+  openH(i, j){ if (j > 0 && j < this.rows) this.hOpen[i][j] = true; }
+
+  /** 与单元格 (cx,cy) 连通的相邻格（依据打通的墙）。 */
+  openNeighbors(cx, cy){
+    const out = [];
+    if (cx > 0            && this.vOpen[cx][cy])     out.push([cx - 1, cy]);
+    if (cx < this.cols - 1 && this.vOpen[cx + 1][cy]) out.push([cx + 1, cy]);
+    if (cy > 0            && this.hOpen[cx][cy])     out.push([cx, cy - 1]);
+    if (cy < this.rows - 1 && this.hOpen[cx][cy + 1]) out.push([cx, cy + 1]);
+    return out;
+  }
+
+  /** BFS 最短路（完美迷宫内唯一路径）：返回单元格序列 a → b。 */
+  solve(a, b){
+    const key = c => c[0] + ',' + c[1];
+    const prev = new Map([[key(a), null]]);
+    const q = [a];
+    while (q.length){
+      const c = q.shift();
+      if (c[0] === b[0] && c[1] === b[1]) break;
+      for (const n of this.openNeighbors(c[0], c[1])){
+        if (!prev.has(key(n))){ prev.set(key(n), c); q.push(n); }
+      }
+    }
+    const path = [];
+    let cur = b;
+    while (cur){ path.unshift(cur); cur = prev.get(key(cur)); }
+    return path;
+  }
+
+  /**
+   * 蛇形迷宫（预设）：逐行往返（第 0 行向右、第 1 行向左……），行末向上连通。
+   * 全部 12 格构成一条唯一的 S 形路径 —— 与 Python 版“点到点”任务的直接推广。
+   */
+  static snake(cols = 4, rows = 3){
+    const m = new Maze(cols, rows);
+    for (let r = 0; r < rows; r++){
+      const l2r = (r % 2 === 0);
+      const xs = [];
+      for (let c = 0; c < cols; c++) xs.push(l2r ? c : cols - 1 - c);
+      for (let c = 0; c < cols; c++){
+        m.path.push([xs[c], r]);
+        if (c > 0) m.openV(Math.max(xs[c], xs[c - 1]), r);  // 打通行内相邻格之间的竖墙
+      }
+      if (r < rows - 1) m.openH(xs[cols - 1], r + 1);        // 行末向上连通到下一行
+    }
+    return m;
+  }
+
+  /**
+   * 随机迷宫：深度优先回溯（recursive backtracker）生成完美迷宫，
+   * 再用 BFS 求起点(0,0) → 终点(cols-1,rows-1) 的唯一路径作为路点序列。
+   */
+  static random(cols, rows, rng){
+    const m = new Maze(cols, rows);
+    const visited = Array.from({length: cols}, () => new Array(rows).fill(false));
+    const stack = [[0, 0]];
+    visited[0][0] = true;
+    while (stack.length){
+      const [cx, cy] = stack[stack.length - 1];
+      const nbs = [];
+      if (cx > 0        && !visited[cx - 1][cy]) nbs.push([cx - 1, cy, 'W']);
+      if (cx < cols - 1 && !visited[cx + 1][cy]) nbs.push([cx + 1, cy, 'E']);
+      if (cy > 0        && !visited[cx][cy - 1]) nbs.push([cx, cy - 1, 'S']);
+      if (cy < rows - 1 && !visited[cx][cy + 1]) nbs.push([cx, cy + 1, 'N']);
+      if (!nbs.length){ stack.pop(); continue; }
+      const [nx, ny, dir] = nbs[Math.floor(rng.next() * nbs.length)];
+      if      (dir === 'W') m.vOpen[cx][cy]     = true;  // 打通 (cx,cy)-(cx-1,cy)
+      else if (dir === 'E') m.vOpen[cx + 1][cy] = true;
+      else if (dir === 'S') m.hOpen[cx][cy]     = true;  // 打通 (cx,cy)-(cx,cy-1)
+      else                  m.hOpen[cx][cy + 1] = true;
+      visited[nx][ny] = true;
+      stack.push([nx, ny]);
+    }
+    m.path = m.solve([0, 0], [cols - 1, rows - 1]);
+    return m;
+  }
+
+  /**
+   * 墙体矩形列表（世界坐标，含外边界；每段向两端各延伸 wt/2 使转角处拼接无缝）。
+   * 用于绘制与碰撞检测（Python 版对应 arena 边界的迷宫化）。
+   */
+  wallRects(){
+    if (this._rects) return this._rects;
+    const R = [], {cols, rows, cs, wt} = this;
+    for (let i = 0; i <= cols; i++)
+      for (let j = 0; j < rows; j++)
+        if (!this.vOpen[i][j])
+          R.push({x: i * cs - wt / 2, y: j * cs - wt / 2, w: wt, h: cs + wt});
+    for (let j = 0; j <= rows; j++)
+      for (let i = 0; i < cols; i++)
+        if (!this.hOpen[i][j])
+          R.push({x: i * cs - wt / 2, y: j * cs - wt / 2, w: cs + wt, h: wt});
+    this._rects = R;
+    return R;
+  }
+}
+
+/* =====================================================================
+ * 3. 仿真环境（sim/environment.py::RobotEnv 的 1:1 移植 + 迷宫化）
+ *    ① 感知 sense()：带高斯噪声的位姿测量（决策层唯一的信息来源）
+ *    ③ 执行 step() ：单车模型欧拉积分 + 限幅 + 墙壁碰撞（对应原活动范围）
+ *    ④ 反馈        ：新测量 + 奖励 + 终止判定（奖励公式与 Python 完全一致）
+ * ===================================================================== */
+const ROBOT_R = 0.17;   // 机器人本体碰撞半径（米），用于墙壁碰撞检测
+
+class Env {
+  constructor(maze, cfg, rng){
+    this.maze = maze; this.cfg = cfg; this.rng = rng;
+    this.walls = maze.wallRects();                            // 墙体（缓存）
+    this.waypoints = maze.path.map(c => maze.cellCenter(c));  // 路点序列（世界坐标）
+    this.maxSteps = Math.max(600, this.waypoints.length * 70); // 超时上限（自适应路点数）
+    // 初始位姿：第一个路点，朝向第二路点（与 Python 版 start=(0,0,0) 同思路）
+    const c0 = this.waypoints[0];
+    const c1 = this.waypoints[1] || [c0[0] + 1, c0[1]];
+    this.start = [c0[0], c0[1], Math.atan2(c1[1] - c0[1], c1[0] - c0[0])];
+    this.reset();
+  }
+
+  /** 复位到初始位姿（噪声随机流续用，保证同迷宫下可复现）。 */
+  reset(){
+    this.state = this.start.slice();   // 真实状态 [x, y, θ]（决策层不可见）
+    this.wpIdx = 0;                    // 当前目标路点下标
+    this.steps = 0;
+    this.done = false;
+    this.timedOut = false;
+    this.collisionCount = 0;
+  }
+
+  get dt(){ return this.cfg.dt; }
+  /** 当前目标路点（决策层通过它计算误差 —— 迷宫化：目标随路点推进切换）。 */
+  target(){ return this.waypoints[this.wpIdx]; }
+
+  /** ① 感知：真实状态 + 高斯噪声 → 测量值 [x̂, ŷ, θ̂]。 */
+  sense(){
+    const [x, y, th] = this.state, c = this.cfg;
+    return [
+      x  + this.rng.normal(0, c.sigmaPos),
+      y  + this.rng.normal(0, c.sigmaPos),
+      th + this.rng.normal(0, c.sigmaTheta),
+    ];
+  }
+
+  /**
+   * 墙壁碰撞检测与推出：把机器人（视作半径 r 的圆）从墙内推到墙外。
+   * 对应 Python 版的“活动范围夹紧 + 越界惩罚”（迷宫化后由边界变为墙体）。
+   * @returns [x, y, hit] 修正后的位置与本步是否碰撞
+   */
+  resolveWalls(x, y, r){
+    let hit = false;
+    for (const w of this.walls){
+      const cx = clamp(x, w.x, w.x + w.w), cy = clamp(y, w.y, w.y + w.h);
+      const dx = x - cx, dy = y - cy, d2 = dx * dx + dy * dy;
+      if (d2 < r * r){
+        hit = true;
+        if (d2 > 1e-12){
+          // 圆心在墙外：沿“最近点 → 圆心”方向推出 (r - d)
+          const d = Math.sqrt(d2);
+          x += dx / d * (r - d);
+          y += dy / d * (r - d);
+        } else {
+          // 圆心陷入墙体：沿最小穿透方向推出
+          const dl = x - w.x, dr = w.x + w.w - x, db = y - w.y, dtp = w.y + w.h - y;
+          const mn = Math.min(dl, dr, db, dtp);
+          if      (mn === dl) x = w.x - r;
+          else if (mn === dr) x = w.x + w.w + r;
+          else if (mn === db) y = w.y - r;
+          else                y = w.y + w.h + r;
+        }
+      }
+    }
+    return [x, y, hit];
+  }
+
+  /**
+   * ③ 执行 + ④ 反馈：动作作用到真实动力学，随后给出新测量 / 奖励 / 终止判定。
+   * 奖励公式与 Python 版 _reward() 逐项一致（路点 +2 为迷宫化扩展，终点 +10 不变）：
+   *   r = -dist - 0.3·|e_head| - 0.05·能耗 - 1·碰撞 + 2·路点 + 10·终点
+   */
+  step(vCmd, wCmd){
+    const c = this.cfg, dt = c.dt;
+    // 动作饱和（执行器物理上限，双保险）
+    const v = clamp(vCmd, 0, c.vMax);
+    const w = clamp(wCmd, -c.wMax, c.wMax);
+    // ---- ③ 执行：单车模型欧拉积分（与 environment.py 完全同方程）----
+    const [x, y, th] = this.state;
+    let nx = x + v * Math.cos(th) * dt;
+    let ny = y + v * Math.sin(th) * dt;
+    const nth = wrapAngle(th + w * dt);
+    // ---- 墙壁碰撞（迷宫化：替代原活动范围夹紧）----
+    let hit;
+    [nx, ny, hit] = this.resolveWalls(nx, ny, ROBOT_R);
+    this.state = [nx, ny, nth];
+    this.steps++;
+    if (hit) this.collisionCount++;
+    // ---- ④ 反馈 1：执行后的新测量（下一圈“感知”的输入）----
+    const obs = this.sense();
+    // ---- 奖励计算（用切换前的当前路点，与 Python 口径一致）----
+    const [gx, gy] = this.target();
+    const dist = Math.hypot(gx - nx, gy - ny);                       // 真实距离误差
+    const eHead = wrapAngle(Math.atan2(gy - ny, gx - nx) - nth);     // 真实航向误差
+    const energy = Math.abs(v) / c.vMax + Math.abs(w) / c.wMax;      // 归一化能耗
+    let r = -dist - 0.3 * Math.abs(eHead) - 0.05 * energy;
+    if (hit) r -= 1.0;                                               // 碰撞惩罚（同越界惩罚）
+    // ---- 路点推进 / 终止判定（迷宫化核心）----
+    let wpEvent = null;
+    if (dist <= c.tol){
+      if (this.wpIdx >= this.waypoints.length - 1){
+        r += 10;                                          // 一次性终点奖励（同 Python）
+        this.done = true;
+        wpEvent = {type: 'goal', x: gx, y: gy};
+      } else {
+        r += 2;                                           // 路点进度奖励（迷宫化扩展）
+        wpEvent = {type: 'wp', x: gx, y: gy};
+        this.wpIdx++;
+      }
+    }
+    let timedOut = false;
+    if (!this.done && this.steps >= this.maxSteps){
+      this.done = true; this.timedOut = true; timedOut = true;
+    }
+    return {
+      obs, reward: r, done: this.done,
+      info: {true: [nx, ny, nth], dist, eHead, v, w, hit, wpEvent, timedOut},
+    };
+  }
+}
+
+/* =====================================================================
+ * 4. 决策器（sim/controller.py::ClosedLoopDecision 的 1:1 移植）
+ *    航向环 PID：e_head → w；距离环 PID：e_dist → v·cos(e_head)，均带限幅
+ * ===================================================================== */
+class Decision {
+  constructor(cfg){
+    this.cfg = cfg;
+    // 航向环：输出 w，限幅 ±w_max，积分限幅同量级（anti-windup）
+    this.pidH = new PID(cfg.kpH, cfg.kiH, cfg.kdH, -cfg.wMax, cfg.wMax, cfg.wMax);
+    // 距离环：输出 v，限幅 [0, v_max]
+    this.pidD = new PID(cfg.kpD, cfg.kiD, cfg.kdD, 0, cfg.vMax, cfg.vMax);
+  }
+  /** 复位两个 PID 的内部状态。 */
+  reset(){ this.pidH.reset(); this.pidD.reset(); }
+  /** 滑块实时调参（对应 Python set_gains：改增益、不清内部状态）。 */
+  syncGains(){
+    const c = this.cfg;
+    this.pidH.setGains(c.kpH, c.kiH, c.kdH);
+    this.pidD.setGains(c.kpD, c.kiD, c.kdD);
+  }
+  /**
+   * ② 决策：输入带噪测量 meas=[x̂,ŷ,θ̂] 与当前目标路点，输出动作 (v, w)。
+   * 与 Python 版 decide() 逐行对应 —— 决策只依赖“测量”，不依赖真值。
+   */
+  decide(meas, target, dt){
+    const gx = target[0], gy = target[1];
+    const ex = gx - meas[0], ey = gy - meas[1];
+    const eDist = Math.hypot(ex, ey);                              // 距离误差（带噪）
+    const eHead = wrapAngle(Math.atan2(ey, ex) - meas[2]);         // 航向误差（带噪，已 wrap）
+    const wRaw = this.pidH.update(eHead, dt);                      // 航向环 → 角速度
+    const vRaw = this.pidD.update(eDist, dt);                      // 距离环 → 期望前进速度
+    // 协调律：航向没对准先减速（避免画大弧冲过路点），再限幅到执行器范围
+    let v = vRaw * Math.max(Math.cos(eHead), 0);
+    v = clamp(v, 0, this.cfg.vMax);
+    const w = clamp(wRaw, -this.cfg.wMax, this.cfg.wMax);
+    return {v, w, eDist, eHead, vRaw, wRaw};
+  }
+}
+
+/* =====================================================================
+ * 5. 闭环单步编排（sim/closed_loop.py::closed_loop_step 的移植）
+ *    一圈 = ①感知 → ②决策 → ③执行 → ④反馈，并记录一行日志
+ * ===================================================================== */
+function closedLoopStep(env, decision, log, hist, marks){
+  const dt = env.dt;
+  const step = log.length, t = step * dt;
+
+  const meas = env.sense();                              // ① 感知
+  const d = decision.decide(meas, env.target(), dt);     // ② 决策（目标 = 当前路点）
+  const out = env.step(d.v, d.w);                        // ③ 执行（内含 ④ 反馈测量/奖励）
+  const ret = (log.length ? log[log.length - 1].ret : 0) + out.reward;   // ④ 累计回报
+
+  // ---- 逐步日志：State（真值+测量）/ Action（指令+执行）/ Reward / Return ----
+  const rec = {
+    step, t,
+    xTrue: out.info.true[0], yTrue: out.info.true[1], thetaTrue: out.info.true[2],
+    xMeas: out.obs[0], yMeas: out.obs[1], thetaMeas: out.obs[2],
+    eDist: d.eDist, eHead: d.eHead,
+    vCmd: d.v, wCmd: d.w, vExec: out.info.v, wExec: out.info.w,
+    reward: out.reward, ret, done: out.done,
+    wp: env.wpIdx + 1, wpTotal: env.waypoints.length,
+    collided: out.info.hit, wpEvent: out.info.wpEvent || null,
+  };
+  log.push(rec);
+
+  // ---- 曲线数据（含角度制航向误差，便于左右双轴展示）----
+  hist.t.push(t);
+  hist.eDist.push(d.eDist);
+  hist.eHead.push(deg(d.eHead));
+  hist.vCmd.push(d.v);
+  hist.wCmd.push(d.w);
+  hist.reward.push(out.reward);
+  hist.ret.push(ret);
+  if (rec.wpEvent) marks.push({t, color: 'rgba(58,201,121,.45)'});          // 路点达成
+  if (rec.collided) marks.push({t, color: 'rgba(239,91,91,.55)'});          // 碰撞
+  return rec;
+}
+
+/* =====================================================================
+ * 6. 应用状态：全局配置（与 Python DEFAULT_CFG 同口径）+ 运行时状态
+ * ===================================================================== */
+const DEFAULTS = {
+  dt: 0.05,          // 仿真步长（秒），= 20Hz，与 Python 版一致
+  vMax: 1.2,         // 最大线速度 (m/s)
+  wMax: 3.0,         // 最大角速度 (rad/s)
+  sigmaPos: 0.02,    // 位置测量噪声 σ（米）
+  sigmaTheta: 0.01,  // 航向测量噪声 σ（弧度）
+  kpH: 2.5, kiH: 0.5,  kdH: 0.08,   // 航向环 PID（同 Python DEFAULT_CFG）
+  kpD: 0.8, kiD: 0.05, kdD: 0.20,   // 距离环 PID
+  tol: 0.30,         // 路点到达容差（米）
+  seed: 7,           // 噪声随机种子（固定 → 可复现）
+};
+const CFG = Object.assign({}, DEFAULTS);
+
+const app = {
+  mode: 'snake',            // 'snake' | 'random' | 'big'
+  state: 'idle',            // 'idle' | 'running' | 'paused' | 'done'
+  speed: 2,                 // 回放倍速（1× = 实时：20 步/秒）
+  mazeSeed: 2026,           // 随机迷宫种子（换迷宫时递增）
+  maze: null, env: null, decision: null, rng: null,
+  log: [],                  // 全量日志（导出 CSV 用）
+  hist: {t: [], eDist: [], eHead: [], vCmd: [], wCmd: [], reward: [], ret: []},
+  marks: [],                // 曲线竖线标记（路点 / 碰撞）
+  flashes: [],              // 画布上的事件闪烁（路点 +2 / 终点 +10 / 碰撞 -1）
+  acc: 0, lastTs: 0,        // 步进累加器（控制仿真速度）
+  phase: 0, phaseTs: 0,     // 四阶段高亮轮换（仅表示闭环持续运转）
+  lastRec: null,
+  pendingRows: [], lastLogTs: 0,
+  show: {meas: true, target: true, noise: true},
+};
+
+/* ---------- 构建 / 重置 ---------- */
+function buildRun(mode){
+  app.mode = mode;
+  if (mode === 'snake'){
+    app.maze = Maze.snake(4, 3);                       // 蛇形预设（4×3，12 路点）
+  } else if (mode === 'big'){
+    app.mazeSeed += 1;
+    app.maze = Maze.random(10, 8, new RNG(app.mazeSeed));   // 大迷宫（10×8，世界 20×16 m）
+  } else {
+    app.mazeSeed += 1;
+    app.maze = Maze.random(5, 4, new RNG(app.mazeSeed));
+  }
+  resetRun();
+  document.getElementById('btnNewMaze').style.display =
+    (mode !== 'snake') ? '' : 'none';                 // 随机类迷宫才提供“换迷宫”
+}
+
+/** 重置当前迷宫的仿真（保留迷宫与滑块参数）。 */
+function resetRun(){
+  app.rng = new RNG(CFG.seed);                 // 噪声流：固定种子 → 同迷宫可复现
+  app.env = new Env(app.maze, CFG, app.rng);
+  app.decision = new Decision(CFG);
+  app.log.length = 0;
+  for (const k in app.hist) app.hist[k].length = 0;
+  app.marks.length = 0;
+  app.flashes.length = 0;
+  app.pendingRows.length = 0;
+  app.acc = 0; app.lastRec = null;
+  app.state = 'idle';
+  setStatus('idle');
+  document.getElementById('logBody').innerHTML = '';
+  updateStartBtn();
+}
+
+/** 执行一圈闭环（供主循环与“单步”按钮共用）。 */
+function doStep(){
+  if (!app.env || app.env.done) return;
+  const rec = closedLoopStep(app.env, app.decision, app.log, app.hist, app.marks);
+  app.lastRec = rec;
+  app.pendingRows.push(rec);
+  if (rec.wpEvent) app.flashes.push({type: rec.wpEvent.type, x: rec.wpEvent.x, y: rec.wpEvent.y, born: performance.now()});
+  if (app.env.done){
+    app.state = 'done';
+    setStatus(app.env.timedOut ? 'timeout' : 'success');
+    updateStartBtn();
+  }
+}
+
+/* =====================================================================
+ * 7. UI 构建：滑块 / 读数瓦片 / 状态徽标
+ * ===================================================================== */
+const SLIDERS = [
+  {k: 'kpH',       label: 'Kp · 航向环',       min: 0, max: 8,    step: 0.1,   d: 2},
+  {k: 'kiH',       label: 'Ki · 航向环',       min: 0, max: 3,    step: 0.05,  d: 2},
+  {k: 'kdH',       label: 'Kd · 航向环',       min: 0, max: 1,    step: 0.02,  d: 2},
+  {k: 'kpD',       label: 'Kp · 距离环',       min: 0, max: 3,    step: 0.05,  d: 2},
+  {k: 'kiD',       label: 'Ki · 距离环',       min: 0, max: 1,    step: 0.01,  d: 2},
+  {k: 'kdD',       label: 'Kd · 距离环',       min: 0, max: 1,    step: 0.02,  d: 2},
+  {k: 'sigmaPos',  label: 'σ · 位置噪声 (m)',  min: 0, max: 0.15, step: 0.005, d: 3},
+  {k: 'sigmaTheta',label: 'σ · 航向噪声 (rad)',min: 0, max: 0.08, step: 0.002, d: 3},
+];
+const PID_KEYS = new Set(['kpH', 'kiH', 'kdH', 'kpD', 'kiD', 'kdD']);
+
+function buildSliders(){
+  const box = document.getElementById('sliders');
+  SLIDERS.forEach(s => {
+    const row = document.createElement('div');
+    row.className = 'srow';
+    row.innerHTML =
+      `<label>${s.label}</label>` +
+      `<input type="range" min="${s.min}" max="${s.max}" step="${s.step}" value="${CFG[s.k]}">` +
+      `<span class="sv">${(+CFG[s.k]).toFixed(s.d)}</span>`;
+    const inp = row.querySelector('input'), sv = row.querySelector('.sv');
+    inp.addEventListener('input', () => {
+      CFG[s.k] = parseFloat(inp.value);
+      sv.textContent = CFG[s.k].toFixed(s.d);
+      if (PID_KEYS.has(s.k) && app.decision) app.decision.syncGains();  // PID 实时生效
+      // σ 噪声由 env 每步读取 CFG，天然实时生效
+    });
+    s.inputEl = inp; s.spanEl = sv;
+    box.appendChild(row);
+  });
+}
+
+/** 恢复 Python 版默认参数（滑块位置与内部增益同步）。 */
+function restoreDefaults(){
+  for (const s of SLIDERS){
+    CFG[s.k] = DEFAULTS[s.k];
+    s.inputEl.value = DEFAULTS[s.k];
+    s.spanEl.textContent = (+DEFAULTS[s.k]).toFixed(s.d);
+  }
+  if (app.decision) app.decision.syncGains();
+}
+
+/* ---------- 读数瓦片 ---------- */
+const TILES = [
+  ['step',  '步数 / 时刻',            'var(--blue)'],
+  ['wp',    '路点进度',               'var(--orange)'],
+  ['true',  '真值 State (x,y,θ°)',   'var(--blue)'],
+  ['meas',  '测量 State (x̂,ŷ,θ̂°)',  'var(--orange)'],
+  ['edist', '距离误差 e (m)',         'var(--blue)'],
+  ['ehead', '航向误差 (°)',           'var(--green)'],
+  ['cmd',   'Action 指令 (v,w)',      'var(--blue)'],
+  ['exec',  'Action 执行 (v′,w′)',   'var(--blue)'],
+  ['rw',    '本步 Reward',            'var(--cyan)'],
+  ['ret',   '累计 Return',            'var(--magenta)'],
+  ['col',   '碰撞次数',               'var(--red)'],
+  ['noise', '噪声 σ 位置/航向',       'var(--muted)'],
+];
+const tileEls = {};
+
+function buildTiles(){
+  const box = document.getElementById('readouts');
+  TILES.forEach(([id, label, color]) => {
+    const el = document.createElement('div');
+    el.className = 'tile';
+    el.innerHTML = `<div class="tl">${label}</div><div class="tv" style="color:${color}">—</div>`;
+    box.appendChild(el);
+    tileEls[id] = el.querySelector('.tv');
+  });
+}
+
+/* ---------- 状态徽标与开始按钮 ---------- */
+function setStatus(s){
+  const b = document.getElementById('statusBadge');
+  const map = {
+    idle:    ['idle',    '● 待运行'],
+    running: ['running', '● 运行中'],
+    paused:  ['paused',  '● 已暂停'],
+    success: ['success', '✔ 到达目标'],
+    timeout: ['timeout', '✖ 超时未到达'],
+  };
+  b.className = 'badge ' + map[s][0];
+  b.textContent = map[s][1];
+}
+function updateStartBtn(){
+  const b = document.getElementById('btnStart');
+  if (app.state === 'running'){ b.textContent = '⏸ 暂停'; b.classList.add('primary'); }
+  else if (app.state === 'done'){ b.textContent = '↻ 重新运行'; b.classList.add('primary'); }
+  else { b.textContent = '▶ 开始'; b.classList.add('primary'); }
+}
+
+/* =====================================================================
+ * 8. 画布尺寸管理（devicePixelRatio 适配，保证高分屏清晰）
+ * ===================================================================== */
+const scene = {cv: null, ctx: null, w: 0, h: 0};
+const charts = {
+  err: {cv: null, ctx: null, w: 0, h: 118, baseH: 118},   // 缩小版，与动作曲线并排
+  act: {cv: null, ctx: null, w: 0, h: 118, baseH: 118},   // 缩小版，与误差曲线并排
+  rw:  {cv: null, ctx: null, w: 0, h: 196, baseH: 196},   // 右列底部（读数之下），与 PID 面板底对齐
+};
+
+function fitCanvas(ch, cssW, cssH){
+  const d = window.devicePixelRatio || 1;
+  ch.cv.width = Math.round(cssW * d);
+  ch.cv.height = Math.round(cssH * d);
+  ch.cv.style.width = cssW + 'px';
+  ch.cv.style.height = cssH + 'px';
+  ch.ctx.setTransform(d, 0, 0, d, 0, 0);
+  ch.w = cssW; ch.h = cssH;
+}
+
+function sizeAll(){
+  // 场景画布：宽度随左列面板自适应，高度按比例缩小（迷宫图更小巧）
+  // 防御：页面创建/隐藏等瞬间布局宽度可能为 0，此时跳过，保留上次的良好尺寸
+  const wrapW = scene.cv.parentElement.clientWidth;
+  if (!isFinite(wrapW) || wrapW <= 0) return;
+  const h = clamp(Math.round(wrapW * 0.72), 360, 520);
+  fitCanvas(scene, wrapW, h);
+  // 三张曲线画布：宽度 = 面板内容宽，高度按各自 baseH（误差/动作 118，Reward 196）
+  for (const k in charts){
+    const cw = charts[k].cv.parentElement.clientWidth;
+    if (!isFinite(cw) || cw <= 0) continue;
+    fitCanvas(charts[k], cw, charts[k].baseH);
+  }
+}
+
+/* =====================================================================
+ * 9. 场景绘制：迷宫 / 路点 / 轨迹 / 带噪测量 / 机器人 / 事件闪烁 / 图例
+ * ===================================================================== */
+function drawLine(ctx, x1, y1, x2, y2){
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+}
+function drawStar(ctx, x, y, r, color){
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++){
+    const a = -Math.PI / 2 + i * Math.PI / 5, rr = (i % 2) ? r * 0.45 : r;
+    const px = x + rr * Math.cos(a), py = y + rr * Math.sin(a);
+    i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+  }
+  ctx.closePath(); ctx.fillStyle = color; ctx.fill();
+}
+function roundRect(ctx, x, y, w, h, r){
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+/** 机器人本体三角形顶点（世界坐标，机头指向 θ；同 Python 版 robot_triangle）。 */
+function robotTriangle(x, y, th, L = 0.26, halfW = 0.13){
+  const c = Math.cos(th), s = Math.sin(th);
+  const nose = [x + L * c, y + L * s];
+  const tx = x - 0.45 * L * c, ty = y - 0.45 * L * s;
+  return [nose, [tx + halfW * s, ty - halfW * c], [tx - halfW * s, ty + halfW * c]];
+}
+
+function drawScene(){
+  const ctx = scene.ctx, W = scene.w, H = scene.h;
+  ctx.clearRect(0, 0, W, H);
+  if (!app.env) return;
+  const m = app.maze, env = app.env, log = app.log;
+
+  // ---- 世界坐标 → 屏幕坐标（等比缩放 + 垂直翻转，y 向上）----
+  const pad = 28;
+  const sc = Math.min((W - 2 * pad) / m.W, (H - 2 * pad) / m.H);
+  if (!(sc > 0)) return;   // 防御：画布尚未完成布局（宽高为 0）时跳过本帧，等待 resize 自愈
+  const ox = (W - sc * m.W) / 2, oy = (H - sc * m.H) / 2;
+  const X = x => ox + x * sc, Y = y => oy + (m.H - y) * sc, L = v => v * sc;
+
+  // ---- 地板：0.5m 淡网格 ----
+  ctx.strokeStyle = 'rgba(90,110,150,.09)'; ctx.lineWidth = 1;
+  for (let gx = 0; gx <= m.W + 1e-9; gx += 0.5) drawLine(ctx, X(gx), Y(0), X(gx), Y(m.H));
+  for (let gy = 0; gy <= m.H + 1e-9; gy += 0.5) drawLine(ctx, X(0), Y(gy), X(m.W), Y(m.H));
+
+  // ---- 墙壁（迷宫本体；含外边界）----
+  for (const w of env.walls){
+    ctx.fillStyle = '#3d4f6d';
+    ctx.fillRect(X(w.x), Y(w.y + w.h), L(w.w), L(w.h));
+    ctx.fillStyle = 'rgba(255,255,255,.07)';   // 顶部 1px 高光，增加立体感
+    ctx.fillRect(X(w.x), Y(w.y + w.h), L(w.w), 1.5);
+  }
+
+  // ---- 规划路点（虚线折线 + 圆点；已过=绿、当前=橙、未来=灰）----
+  const wps = env.waypoints;
+  ctx.setLineDash([6, 6]);
+  ctx.strokeStyle = 'rgba(160,180,210,.35)'; ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  wps.forEach((p, i) => i ? ctx.lineTo(X(p[0]), Y(p[1])) : ctx.moveTo(X(p[0]), Y(p[1])));
+  ctx.stroke();
+  ctx.setLineDash([]);
+  wps.forEach((p, i) => {
+    const reached = i < env.wpIdx, current = (i === env.wpIdx) && !env.done;
+    ctx.beginPath();
+    ctx.arc(X(p[0]), Y(p[1]), current ? 5 : 3.5, 0, 2 * Math.PI);
+    if (reached){ ctx.fillStyle = 'rgba(58,201,121,.75)'; ctx.fill(); }
+    else {
+      ctx.strokeStyle = current ? '#f0a03c' : 'rgba(160,180,210,.45)';
+      ctx.lineWidth = current ? 2 : 1.2;
+      ctx.stroke();
+    }
+  });
+  // 当前路点：脉冲圆环（半径下限保护，防止极端缩放下 arc 负半径异常）
+  if (!env.done){
+    const p = env.target(), now = performance.now();
+    const rr = Math.max(L(0.18 + 0.08 * Math.sin(now / 260)), 2);
+    ctx.beginPath(); ctx.arc(X(p[0]), Y(p[1]), rr, 0, 2 * Math.PI);
+    ctx.strokeStyle = 'rgba(240,160,60,.65)'; ctx.lineWidth = 1.5; ctx.stroke();
+  }
+  // 终点：星标 + 容差圈（脉冲）
+  const g = wps[wps.length - 1], now2 = performance.now();
+  drawStar(ctx, X(g[0]), Y(g[1]), Math.max(8 + 1.6 * Math.sin(now2 / 300), 5), '#ef5b5b');
+  ctx.beginPath(); ctx.arc(X(g[0]), Y(g[1]), Math.max(L(CFG.tol), 4), 0, 2 * Math.PI);
+  ctx.strokeStyle = 'rgba(239,91,91,.45)'; ctx.setLineDash([4, 4]);
+  ctx.lineWidth = 1.2; ctx.stroke(); ctx.setLineDash([]);
+  // 起点
+  ctx.fillStyle = 'rgba(58,201,121,.9)';
+  ctx.beginPath(); ctx.arc(X(env.start[0]), Y(env.start[1]), 4.5, 0, 2 * Math.PI); ctx.fill();
+  ctx.fillStyle = 'rgba(139,160,186,.8)'; ctx.font = '10px ' + 'sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText('起点', X(env.start[0]) - 10, Y(env.start[1]) - 9);
+  ctx.fillText('终点', X(g[0]) - 10, Y(g[1]) - 13);
+
+  // ---- 真实轨迹（蓝色实线，逐步延伸）----
+  if (log.length){
+    ctx.strokeStyle = '#4f8ef7'; ctx.lineWidth = 2; ctx.beginPath();
+    const stride = Math.max(1, Math.floor(log.length / 600));
+    for (let i = 0; i < log.length; i += stride){
+      const r = log[i];
+      i ? ctx.lineTo(X(r.xTrue), Y(r.yTrue)) : ctx.moveTo(X(r.xTrue), Y(r.yTrue));
+    }
+    const lr = log[log.length - 1];
+    ctx.lineTo(X(lr.xTrue), Y(lr.yTrue));
+    ctx.stroke();
+  }
+
+  // ---- 带噪测量散点（①感知的不确定性可视化：围绕真实轨迹的橙色散布）----
+  if (app.show.meas && log.length){
+    ctx.strokeStyle = 'rgba(240,160,60,.55)'; ctx.lineWidth = 1;
+    const stride = Math.max(1, Math.floor(log.length / 500));
+    for (let i = 0; i < log.length; i += stride){
+      const r = log[i], px = X(r.xMeas), py = Y(r.yMeas);
+      drawLine(ctx, px - 2.5, py - 2.5, px + 2.5, py + 2.5);   // “×”标记
+      drawLine(ctx, px - 2.5, py + 2.5, px + 2.5, py - 2.5);
+    }
+  }
+
+  // ---- 决策目标线（②决策依据：从“测量位置”指向当前路点）----
+  if (app.show.target && app.lastRec && !env.done){
+    const r = app.lastRec, tg = env.target();
+    ctx.setLineDash([5, 5]);
+    ctx.strokeStyle = 'rgba(240,160,60,.5)'; ctx.lineWidth = 1.3;
+    drawLine(ctx, X(r.xMeas), Y(r.yMeas), X(tg[0]), Y(tg[1]));
+    ctx.setLineDash([]);
+  }
+
+  // ---- 测量位姿“幽灵”三角形（感知到的自己，与真实本体错位即噪声）----
+  if (app.show.meas && app.lastRec){
+    const r = app.lastRec;
+    const pts = robotTriangle(r.xMeas, r.yMeas, r.thetaMeas, 0.20, 0.10);
+    ctx.beginPath();
+    pts.forEach((p, i) => i ? ctx.lineTo(X(p[0]), Y(p[1])) : ctx.moveTo(X(p[0]), Y(p[1])));
+    ctx.closePath();
+    ctx.strokeStyle = 'rgba(240,160,60,.6)'; ctx.lineWidth = 1.4; ctx.stroke();
+  }
+
+  // ---- 噪声不确定度圈（3σ，跟随机器人；直观显示感知精度）----
+  if (app.show.noise){
+    const [x, y] = env.state;
+    ctx.setLineDash([3, 4]);
+    ctx.beginPath(); ctx.arc(X(x), Y(y), Math.max(L(3 * CFG.sigmaPos), 3), 0, 2 * Math.PI);
+    ctx.strokeStyle = 'rgba(140,152,175,.55)'; ctx.lineWidth = 1; ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // ---- 机器人本体（蓝色三角，机头 = 航向）----
+  {
+    const [x, y, th] = env.state;
+    const pts = robotTriangle(x, y, th);
+    ctx.beginPath();
+    pts.forEach((p, i) => i ? ctx.lineTo(X(p[0]), Y(p[1])) : ctx.moveTo(X(p[0]), Y(p[1])));
+    ctx.closePath();
+    ctx.fillStyle = '#5f9bff'; ctx.fill();
+    ctx.strokeStyle = '#0b0f17'; ctx.lineWidth = 1.2; ctx.stroke();
+    ctx.fillStyle = '#ffd27d';   // 重心点
+    ctx.beginPath(); ctx.arc(X(x), Y(y), 2.2, 0, 2 * Math.PI); ctx.fill();
+  }
+
+  // ---- 事件闪烁：路点 +2 / 终点 +10 / 碰撞 -1（扩散圆环 + 文本）----
+  const now = performance.now();
+  app.flashes = app.flashes.filter(f => now - f.born < 750);
+  for (const f of app.flashes){
+    const age = (now - f.born) / 750, a = 1 - age;
+    const color = f.type === 'goal' ? '#3ac979' : (f.type === 'wp' ? '#f0a03c' : '#ef5b5b');
+    const label = f.type === 'goal' ? '+10 终点' : (f.type === 'wp' ? '+2 路点' : '-1 碰撞');
+    ctx.beginPath(); ctx.arc(X(f.x), Y(f.y), Math.max(L(0.12 + age * 0.55), 3), 0, 2 * Math.PI);
+    ctx.strokeStyle = color; ctx.globalAlpha = a; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = color; ctx.font = 'bold 11px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText(label, X(f.x), Y(f.y) - L(0.12 + age * 0.55) - 6);
+    ctx.globalAlpha = 1;
+  }
+
+  // ---- 图例（左上角）----
+  {
+    const items = [
+      ['#4f8ef7', '真实轨迹'],
+      ['#f0a03c', '× 带噪测量 / 幽灵位姿'],
+      ['rgba(170,190,220,.75)', '规划路点'],
+      ['#ef5b5b', '★ 终点（容差圈）'],
+      ['rgba(140,152,175,.8)', '⋯ 噪声 3σ 圈'],
+    ];
+    const bw = 178, bh = items.length * 16 + 12;
+    ctx.fillStyle = 'rgba(10,14,22,.72)';
+    roundRect(ctx, 10, 10, bw, bh, 6); ctx.fill();
+    ctx.strokeStyle = 'rgba(34,48,74,.9)'; ctx.lineWidth = 1; ctx.stroke();
+    ctx.font = '11px sans-serif'; ctx.textAlign = 'left';
+    items.forEach(([c, txt], i) => {
+      const yy = 10 + 14 + i * 16;
+      ctx.strokeStyle = c; ctx.lineWidth = 2.5;
+      drawLine(ctx, 18, yy, 32, yy);
+      ctx.fillStyle = 'rgba(217,227,240,.85)';
+      ctx.fillText(txt, 38, yy + 3.5);
+    });
+  }
+
+  // ---- 完成 / 超时覆盖层 ----
+  if (env.done){
+    ctx.fillStyle = 'rgba(8,11,18,.55)';
+    ctx.fillRect(0, 0, W, H);
+    const cw = Math.min(400, W - 60), chh = 128;
+    const cx0 = (W - cw) / 2, cy0 = (H - chh) / 2;
+    ctx.fillStyle = '#101a2a';
+    roundRect(ctx, cx0, cy0, cw, chh, 10); ctx.fill();
+    ctx.strokeStyle = env.timedOut ? 'rgba(239,91,91,.6)' : 'rgba(58,201,121,.6)';
+    ctx.lineWidth = 1.5; ctx.stroke();
+    ctx.textAlign = 'center';
+    ctx.fillStyle = env.timedOut ? '#ef5b5b' : '#3ac979';
+    ctx.font = 'bold 19px sans-serif';
+    ctx.fillText(env.timedOut ? '✖ 超时未到达' : '✔ 到达目标', W / 2, cy0 + 34);
+    ctx.fillStyle = '#d9e3f0'; ctx.font = '12.5px sans-serif';
+    ctx.fillText(`步数 ${env.steps} · 用时 ${(env.steps * env.dt).toFixed(1)} s`, W / 2, cy0 + 62);
+    ctx.fillText(
+      `累计 Return ${fmt(app.log.length ? app.log[app.log.length - 1].ret : 0, 1)}` +
+      ` · 碰撞 ${env.collisionCount} 次 · 路点 ${env.wpIdx + 1}/${env.waypoints.length}`,
+      W / 2, cy0 + 84);
+    ctx.fillStyle = '#5c7089'; ctx.font = '11px sans-serif';
+    ctx.fillText('点击「重新运行」或「↺ 重置」可再来一次', W / 2, cy0 + 108);
+  }
+}
+
+/* =====================================================================
+ * 10. 曲线绘制：通用迷你折线图（双 Y 轴 / 网格 / 阈值线 / 事件标记）
+ * ===================================================================== */
+function fmtTick(v, span){
+  const d = span >= 10 ? 0 : (span >= 1 ? 1 : 2);
+  return v.toFixed(d);
+}
+
+/**
+ * @param ch    画布对象 {ctx,w,h}
+ * @param series 序列数组：[{data: number[], color, axis: 0|1}]
+ * @param opts   {hLines: [{v,axis,color,label}], marks: [{t,color}]}
+ */
+function plot(ch, series, opts = {}){
+  const ctx = ch.ctx, W = ch.w, H = ch.h;
+  if (!(W > 60 && H > 40)) return;   // 防御：画布尚未布局完成时跳过本帧
+  ctx.clearRect(0, 0, W, H);
+  const h = app.hist, n = h.t.length;
+  if (!n){
+    ctx.fillStyle = '#5c7089'; ctx.font = '12px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('等待仿真数据…（点击「开始」）', W / 2, H / 2);
+    return;
+  }
+  const t1 = Math.max(h.t[n - 1], 1);
+  // 边距自适应：有右轴序列（双轴图）保留右刻度空间，否则收窄（小图最大化绘图区）
+  const hasRight = series.some(s => s.axis === 1);
+  const ML = 46, MR = hasRight ? 46 : 14, MT = 10, MB = 18;
+  const pw = W - ML - MR, ph = H - MT - MB;
+
+  // ---- 双轴自适应范围 ----
+  const ax = [{lo: Infinity, hi: -Infinity}, {lo: Infinity, hi: -Infinity}];
+  for (const s of series){
+    for (const v of s.data){
+      if (v < ax[s.axis].lo) ax[s.axis].lo = v;
+      if (v > ax[s.axis].hi) ax[s.axis].hi = v;
+    }
+  }
+  for (const a of ax){
+    if (!isFinite(a.lo)){ a.lo = 0; a.hi = 1; }
+    if (a.hi - a.lo < 1e-9){ a.hi = a.lo + 1; }
+    const p = (a.hi - a.lo) * 0.08; a.lo -= p; a.hi += p;
+  }
+  const px = t => ML + (t / t1) * pw;
+  const py = (v, a) => MT + (ax[a].hi - v) / (ax[a].hi - ax[a].lo) * ph;
+
+  // ---- 网格 + 左轴刻度 ----
+  ctx.font = '10px ' + 'monospace';
+  for (let i = 0; i <= 4; i++){
+    const yy = MT + ph * i / 4;
+    ctx.strokeStyle = 'rgba(90,110,150,.14)'; ctx.lineWidth = 1;
+    drawLine(ctx, ML, yy, W - MR, yy);
+    ctx.fillStyle = '#5c7089'; ctx.textAlign = 'right';
+    ctx.fillText(fmtTick(ax[0].hi - (ax[0].hi - ax[0].lo) * i / 4, ax[0].hi - ax[0].lo), ML - 6, yy + 3);
+  }
+  // 右轴刻度（用第一个右轴序列的颜色）
+  const rightSeries = series.find(s => s.axis === 1);
+  if (rightSeries){
+    for (let i = 0; i <= 4; i++){
+      const yy = MT + ph * i / 4;
+      ctx.fillStyle = rightSeries.color; ctx.textAlign = 'left';
+      ctx.fillText(fmtTick(ax[1].hi - (ax[1].hi - ax[1].lo) * i / 4, ax[1].hi - ax[1].lo), W - MR + 6, yy + 3);
+    }
+  }
+  // 零线（范围跨 0 时）
+  if (ax[0].lo < 0 && ax[0].hi > 0){
+    const yy = py(0, 0);
+    ctx.strokeStyle = 'rgba(255,255,255,.22)'; ctx.lineWidth = 1;
+    drawLine(ctx, ML, yy, W - MR, yy);
+  }
+
+  // ---- 事件标记（路点 / 碰撞：竖直细线）----
+  for (const mk of (opts.marks || [])){
+    ctx.strokeStyle = mk.color; ctx.lineWidth = 1;
+    drawLine(ctx, px(Math.min(mk.t, t1)), MT, px(Math.min(mk.t, t1)), MT + ph);
+  }
+  // ---- 阈值 / 限幅水平线 ----
+  for (const hl of (opts.hLines || [])){
+    if (hl.v < ax[hl.axis].lo || hl.v > ax[hl.axis].hi) continue;
+    const yy = py(hl.v, hl.axis);
+    ctx.setLineDash([5, 4]);
+    ctx.strokeStyle = hl.color; ctx.lineWidth = 1;
+    drawLine(ctx, ML, yy, W - MR, yy);
+    ctx.setLineDash([]);
+    if (hl.label){
+      ctx.fillStyle = hl.color; ctx.textAlign = 'right'; ctx.font = '10px sans-serif';
+      ctx.fillText(hl.label, W - MR - 4, yy - 4);
+    }
+  }
+
+  // ---- 序列折线（超长时抽稀）+ 末端圆点 ----
+  const stride = Math.max(1, Math.floor(n / 500));
+  for (const s of series){
+    ctx.strokeStyle = s.color; ctx.lineWidth = 1.6; ctx.beginPath();
+    let started = false;
+    for (let i = 0; i < n; i += stride){
+      const xx = px(h.t[i]), yy = py(s.data[i], s.axis);
+      started ? ctx.lineTo(xx, yy) : (ctx.moveTo(xx, yy), started = true);
+    }
+    ctx.lineTo(px(h.t[n - 1]), py(s.data[n - 1], s.axis));
+    ctx.stroke();
+    ctx.fillStyle = s.color;
+    ctx.beginPath();
+    ctx.arc(px(h.t[n - 1]), py(s.data[n - 1], s.axis), 2.6, 0, 2 * Math.PI);
+    ctx.fill();
+  }
+  // ---- 时间轴 ----
+  ctx.fillStyle = '#5c7089'; ctx.textAlign = 'center'; ctx.font = '10px monospace';
+  [0, t1 / 2, t1].forEach(tv => ctx.fillText(tv.toFixed(1) + 's', px(tv), H - 5));
+}
+
+function drawCharts(){
+  const h = app.hist;
+  // 图 1：距离误差（左轴）+ 航向误差（右轴，度），含路点容差线与事件标记
+  plot(charts.err, [
+    {data: h.eDist, color: '#4f8ef7', axis: 0},
+    {data: h.eHead.map(Math.abs), color: '#3ac979', axis: 1},
+  ], {
+    hLines: [{v: CFG.tol, axis: 0, color: 'rgba(239,91,91,.75)', label: '路点容差'}],
+    marks: app.marks,
+  });
+  // 图 2：动作 v / w（左轴），含执行器限幅线
+  plot(charts.act, [
+    {data: h.vCmd, color: '#4f8ef7', axis: 0},
+    {data: h.wCmd, color: '#3ac979', axis: 0},
+  ], {
+    hLines: [
+      {v: CFG.vMax, axis: 0, color: 'rgba(79,142,247,.4)', label: 'v_max'},
+      {v: CFG.wMax, axis: 0, color: 'rgba(58,201,121,.4)', label: '±w_max'},
+      {v: -CFG.wMax, axis: 0, color: 'rgba(58,201,121,.4)'},
+    ],
+    marks: app.marks,
+  });
+  // 图 3：逐步 Reward（左轴）+ 累计 Return（右轴）
+  plot(charts.rw, [
+    {data: h.reward, color: '#35d0c5', axis: 0},
+    {data: h.ret, color: '#d06bf2', axis: 1},
+  ], {marks: app.marks});
+}
+
+/* =====================================================================
+ * 11. 面板与日志的文本更新
+ * ===================================================================== */
+const stageEls = [];
+const stageValEls = [];
+
+function updatePipelineUI(){
+  const env = app.env, r = app.lastRec;
+  document.getElementById('loopStepInfo').textContent =
+    `Step ${app.log.length} · t=${(app.log.length * CFG.dt).toFixed(2)} s · 路点 ${env.wpIdx + 1}/${env.waypoints.length}`;
+  if (!r){ stageValEls.forEach(v => v.textContent = '—'); return; }
+  stageValEls[0].textContent = `x̂${fmt(r.xMeas)} ŷ${fmt(r.yMeas)} θ̂${fmt(deg(r.thetaMeas), 0)}°`;
+  stageValEls[1].textContent = `e ${r.eDist.toFixed(2)}m ${fmt(deg(r.eHead), 0)}° → v${r.vCmd.toFixed(2)} w${fmt(r.wCmd)}`;
+  stageValEls[2].textContent = `v'${r.vExec.toFixed(2)} w'${fmt(r.wExec)} → (${fmt(r.xTrue)},${fmt(r.yTrue)},${fmt(deg(r.thetaTrue), 0)}°)`;
+  stageValEls[3].textContent = `r ${fmt(r.reward)} Ret ${fmt(r.ret, 1)}${r.collided ? ' ⚠碰撞' : ''}`;
+}
+
+function updateReadouts(){
+  const env = app.env, r = app.lastRec;
+  tileEls.step.textContent = `${app.log.length} · ${(app.log.length * CFG.dt).toFixed(2)}s`;
+  tileEls.wp.textContent = `${env.wpIdx + 1} / ${env.waypoints.length}`;
+  const [x, y, th] = env.state;
+  tileEls.true.textContent = `(${fmt(x)},${fmt(y)},${fmt(deg(th), 0)}°)`;
+  if (r){
+    tileEls.meas.textContent = `(${fmt(r.xMeas)},${fmt(r.yMeas)},${fmt(deg(r.thetaMeas), 0)}°)`;
+    tileEls.edist.textContent = r.eDist.toFixed(3);
+    tileEls.ehead.textContent = fmt(deg(r.eHead), 1);
+    tileEls.cmd.textContent = `${r.vCmd.toFixed(2)} / ${fmt(r.wCmd)}`;
+    tileEls.exec.textContent = `${r.vExec.toFixed(2)} / ${fmt(r.wExec)}`;
+    tileEls.rw.textContent = fmt(r.reward);
+    tileEls.ret.textContent = fmt(r.ret, 1);
+  } else {
+    ['meas', 'edist', 'ehead', 'cmd', 'exec', 'rw', 'ret'].forEach(k => tileEls[k].textContent = '—');
+    tileEls.ret.textContent = '0.0';
+  }
+  tileEls.col.textContent = `${env.collisionCount}`;
+  tileEls.noise.textContent = `${CFG.sigmaPos.toFixed(3)} / ${CFG.sigmaTheta.toFixed(3)}`;
+}
+
+function rowHtml(r){
+  return `<tr>` +
+    `<td>${r.step}</td>` +
+    `<td class="mono">${r.t.toFixed(2)}</td>` +
+    `<td class="mono">(${fmt(r.xTrue)}, ${fmt(r.yTrue)}, ${fmt(deg(r.thetaTrue), 0)}°)</td>` +
+    `<td class="mono">(${fmt(r.xMeas)}, ${fmt(r.yMeas)}, ${fmt(deg(r.thetaMeas), 0)}°)</td>` +
+    `<td class="mono">v ${r.vCmd.toFixed(2)} · w ${fmt(r.wCmd)}</td>` +
+    `<td class="mono ${r.reward >= 0 ? 'pos' : 'neg'}">${fmt(r.reward)}</td>` +
+    `<td class="mono">${fmt(r.ret, 1)}</td>` +
+    `<td>${r.wp}/${r.wpTotal}${r.collided ? ' ⚠' : ''}</td>` +
+    `</tr>`;
+}
+
+/* =====================================================================
+ * 12. 事件绑定 / CSV 导出 / 主循环
+ * ===================================================================== */
+function bindEvents(){
+  document.getElementById('btnStart').addEventListener('click', () => {
+    if (app.state === 'running'){ app.state = 'paused'; setStatus('paused'); }
+    else {
+      if (app.state === 'done') resetRun();
+      app.state = 'running'; setStatus('running');
+    }
+    updateStartBtn();
+  });
+  document.getElementById('btnStep').addEventListener('click', () => {
+    if (app.state === 'done') resetRun();
+    doStep();
+    if (app.state !== 'done'){ app.state = 'paused'; setStatus('paused'); }
+    updateStartBtn();
+  });
+  document.getElementById('btnReset').addEventListener('click', () => { resetRun(); });
+  document.getElementById('btnNewMaze').addEventListener('click', () => {
+    // 在当前迷宫类型下重新生成（随机 5×4 或大迷宫 10×8；蛇形为固定预设不显示此按钮）
+    buildRun(app.mode === 'snake' ? 'random' : app.mode);
+  });
+  document.getElementById('mazeSelect').addEventListener('change', e => {
+    buildRun(e.target.value);
+  });
+  document.getElementById('speedSelect').addEventListener('change', e => {
+    app.speed = parseFloat(e.target.value);
+  });
+  document.getElementById('btnDefault').addEventListener('click', restoreDefaults);
+  document.getElementById('btnCsv').addEventListener('click', exportCSV);
+  document.getElementById('toggleMeas').addEventListener('change', e => app.show.meas = e.target.checked);
+  document.getElementById('toggleTarget').addEventListener('change', e => app.show.target = e.target.checked);
+  document.getElementById('toggleNoise').addEventListener('change', e => app.show.noise = e.target.checked);
+  // 键盘快捷键：空格=开始/暂停，S=单步，R=重置
+  window.addEventListener('keydown', e => {
+    if (['INPUT', 'SELECT', 'TEXTAREA', 'BUTTON'].includes(e.target.tagName)) return;
+    if (e.code === 'Space'){ e.preventDefault(); document.getElementById('btnStart').click(); }
+    else if (e.key === 's' || e.key === 'S'){ document.getElementById('btnStep').click(); }
+    else if (e.key === 'r' || e.key === 'R'){ resetRun(); }
+  });
+  window.addEventListener('resize', sizeAll);
+}
+
+/** 导出完整日志 CSV（字段与 Python 版 closed_loop_log.csv 同口径 + waypoint/collision）。 */
+function exportCSV(){
+  const head = ['step', 't',
+    'x_true', 'y_true', 'theta_true',
+    'x_meas', 'y_meas', 'theta_meas',
+    'e_dist', 'e_head',
+    'v_cmd', 'w_cmd', 'v_exec', 'w_exec',
+    'reward', 'ret', 'done', 'waypoint', 'collision'];
+  const lines = [head.join(',')];
+  for (const r of app.log){
+    lines.push([
+      r.step, r.t.toFixed(3),
+      r.xTrue.toFixed(4), r.yTrue.toFixed(4), r.thetaTrue.toFixed(4),
+      r.xMeas.toFixed(4), r.yMeas.toFixed(4), r.thetaMeas.toFixed(4),
+      r.eDist.toFixed(4), r.eHead.toFixed(4),
+      r.vCmd.toFixed(4), r.wCmd.toFixed(4), r.vExec.toFixed(4), r.wExec.toFixed(4),
+      r.reward.toFixed(4), r.ret.toFixed(4),
+      r.done ? 1 : 0, r.wp, r.collided ? 1 : 0,
+    ].join(','));
+  }
+  const blob = new Blob(['\ufeff' + lines.join('\n')], {type: 'text/csv;charset=utf-8'});  // BOM：Excel 中文兼容
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'closed_loop_maze_log.csv';
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1500);
+}
+
+/* ---------- 主循环：固定步长推进（1× = 20 步/秒 = 实时）+ 每帧重绘 ----------
+   结构要点：全部工作包在 try/catch 中，且 requestAnimationFrame 在保护之外
+   重注册 —— 即使某一帧绘制出现异常（如极端窗口尺寸下的负半径），
+   动画循环也不会中断，下一帧继续，保证闭环演示始终存活。 */
+function frame(ts){
+  try {
+    if (!app.lastTs) app.lastTs = ts;
+    const dtw = Math.min((ts - app.lastTs) / 1000, 0.1);   // 帧间墙钟时间（秒），限幅防卡顿跳变
+    app.lastTs = ts;
+
+    // ---- 仿真推进：acc 累积墙钟时间 × 基准步频(20Hz) × 倍速 ----
+    if (app.state === 'running'){
+      app.acc += dtw * 20 * app.speed;
+      let n = Math.floor(app.acc);
+      app.acc -= n;
+      if (n > 80) n = 80;                                    // 防卡顿后补帧雪崩
+      for (let i = 0; i < n && app.state === 'running'; i++) doStep();
+    }
+
+    // ---- 四阶段高亮轮换（仅运行中；表示闭环持续流转）----
+    if (app.state === 'running' && ts - app.phaseTs > 220){
+      app.phase = (app.phase + 1) % 4;
+      app.phaseTs = ts;
+      stageEls.forEach((el, i) => el.classList.toggle('active', i === app.phase));
+    } else if (app.state === 'idle'){
+      stageEls.forEach(el => el.classList.remove('active'));
+    }
+
+    // ---- 日志表追加（节流：约 8 行/秒，避免高频 DOM 抖动）----
+    if (app.pendingRows.length && ts - app.lastLogTs > 120){
+      app.lastLogTs = ts;
+      const body = document.getElementById('logBody');
+      const frag = document.createDocumentFragment();
+      for (const r of app.pendingRows){
+        const tr = document.createElement('tr');
+        tr.innerHTML = rowHtml(r);
+        frag.appendChild(tr);
+      }
+      app.pendingRows.length = 0;
+      body.appendChild(frag);
+      while (body.children.length > 90) body.removeChild(body.firstChild);
+      if (app.state === 'running'){
+        const sc = document.getElementById('logScroll');
+        sc.scrollTop = sc.scrollHeight;
+      }
+    }
+
+    // ---- 每帧重绘（数据量 ≤ 数千点，性能开销可忽略）----
+    drawScene();
+    drawCharts();
+    updatePipelineUI();
+    updateReadouts();
+  } catch (err) {
+    // 单帧异常只跳过该帧，不中断动画循环（首次异常打印到控制台便于排查）
+    if (!frame._errLogged){ frame._errLogged = true; console.error('[闭环Demo] 渲染帧异常（已跳过）：', err); }
+  }
+  requestAnimationFrame(frame);   // 无条件重注册：动画循环永不中断
+}
+
+/* =====================================================================
+ * 13. 初始化
+ * ===================================================================== */
+(function init(){
+  // 画布对象
+  scene.cv = document.getElementById('scene');
+  scene.ctx = scene.cv.getContext('2d');
+  charts.err.cv = document.getElementById('chartErr');
+  charts.act.cv = document.getElementById('chartAct');
+  charts.rw.cv  = document.getElementById('chartRw');
+  for (const k in charts) charts[k].ctx = charts[k].cv.getContext('2d');
+
+  // 四阶段卡片引用
+  for (let i = 0; i < 4; i++){
+    stageEls.push(document.getElementById('st' + i));
+    stageValEls.push(document.getElementById('val' + i));
+  }
+  buildSliders();
+  buildTiles();
+  bindEvents();
+  sizeAll();
+  // 初始迷宫跟随 select 实际值（浏览器可能恢复上次的表单状态）
+  buildRun(document.getElementById('mazeSelect').value || 'snake');
+  requestAnimationFrame(frame);
+  // 布局完成较晚时自愈重算尺寸（与 sizeAll 的零宽防御配合）
+  window.addEventListener('load', sizeAll);
+  window.__demo = app;        // 暴露给控制台 / 自动化测试用
+})();
+</script>
+</body>
+</html>
